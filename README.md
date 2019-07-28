@@ -258,6 +258,7 @@ third_secret: '----BEGIN SECRET KEY----
 ```
 
 ### Launch a process loading secrets through environment variables
+TODO: fix me
 ```console
 $ vault env --path blob_secret -- env
 ...
@@ -393,6 +394,8 @@ $ VAULT_CLI_URL=https://myvault.com vault list
 The name is always the uppercase underscored name of the equivalent command
 line option. Token and password can also be passed as environment variables as
 VAULT_CLI_TOKEN and VAULT_CLI_PASSWORD.
+
+TODO: how to upgrade
 
 ## Troubleshooting
 

@@ -3,7 +3,17 @@ import logging
 import os
 import pathlib
 import sys
-from typing import Any, Dict, Mapping, NoReturn, Optional, Sequence, TextIO
+from typing import (
+    Any,
+    Dict,
+    Generator,
+    Mapping,
+    NoReturn,
+    Optional,
+    Sequence,
+    TextIO,
+    Tuple,
+)
 
 import click
 import yaml
@@ -220,12 +230,13 @@ def get_all(client_obj: client.VaultClientBase, path: Sequence[str], flat: bool)
     ),
 )
 @click.argument("name")
+@click.argument("key", required=False)
 @handle_errors()
-def get(client_obj: client.VaultClientBase, text: bool, name: str):
+def get(client_obj: client.VaultClientBase, text: bool, key: Optional[str], name: str):
     """
     Return a single secret value.
     """
-    secret = client_obj.get_secret(path=name)
+    secret = client_obj.get_secret(path=name, key=key)
     force_yaml = isinstance(secret, list) or isinstance(secret, dict)
     if text and not force_yaml:
         if secret is None:
@@ -238,16 +249,43 @@ def get(client_obj: client.VaultClientBase, text: bool, name: str):
     )
 
 
+def build_kv(attributes: Sequence[str]) -> Generator[Tuple[str, str], None, None]:
+    """
+    Converts a list of "key=value" to tuples (key, value).
+    If the value is "-" then reads the secret from stdin.
+    """
+    for item in attributes:
+        try:
+            k, v = item.split("=", 1)
+        except ValueError:
+            raise click.UsageError(
+                f"Expecting 'key=value' arguments. '{ item }' provided."
+            )
+        if v == "-":
+            v = click.get_text_stream("stdin").read()
+        yield k, v
+
+
 @cli.command("set")
 @click.pass_obj
-@click.option("--yaml", "format_yaml", is_flag=True)
 @click.option(
+    "--update/--clear",
+    default=True,
+    help="Update the current kv mapping or replace the its content",
+)
+@click.option(
+    "-p",
     "--prompt",
     is_flag=True,
-    default=False,
-    help="Prompt user for value using a hidden input.",
+    help="Prompt user for values using a hidden input. Keys name are passed as arguments",
 )
-@click.option("--stdin/--no-stdin", default=False)
+@click.option(
+    "--file",
+    "yaml_file",
+    default=None,
+    help="Read key/value mapping from a file. A filename of '-' reads the standard input",
+    type=click.File(),
+)
 @click.option(
     "--force/--no-force",
     "-f",
@@ -256,62 +294,49 @@ def get(client_obj: client.VaultClientBase, text: bool, name: str):
     help="In case the path already holds a secret, allow overwriting it "
     "(this is necessary only if --safe-write is set).",
 )
-@click.option(
-    "--strip/--no-strip",
-    default=True,
-    help="If --no-strip is set, value will not be stripped of surrounding whitespaces",
-)
-@click.argument("name")
-@click.argument("value", nargs=-1)
+@click.argument("path")
+@click.argument("attributes", nargs=-1, metavar="[key=value...]")
 @handle_errors()
 def set_(
     client_obj: client.VaultClientBase,
-    format_yaml: bool,
+    update: bool,
     prompt: bool,
-    stdin: bool,
-    strip: bool,
-    name: str,
-    value: Sequence[str],
+    yaml_file: TextIO,
+    path: str,
+    attributes: Sequence[str],
     force: Optional[bool],
 ):
     """
-    Set a single secret to the given value(s).
+    Set a secret.
 
-    Value can be either passed as argument (several arguments will be
-    interpreted as a list) or via stdin with the --stdin flag.
+    \b
+    You can give secrets in 3 different ways:
+    - Usage: vault set [OPTIONS] PATH [key=value...]
+      directly in the arguments. A value of "-" means that value will be read from the standard input
+    - Usage: vault set [OPTIONS] PATH --prompt [key...]
+      prompt user for a values using hidden input
+    - Usage: vault set [OPTIONS] PATH --file=/path/to/file
+      using a json/yaml file
     """
-    if prompt + bool(value) + stdin > 1:
+    if bool(attributes) + bool(yaml_file) > 1:
         raise click.UsageError(
-            "Conflicting input methods: use only one of --prompt, --stdin and "
-            "positional argument"
+            "Conflicting input methods: you can't mix --file and positional argument"
         )
 
     json_value: types.JSONValue
-    if stdin:
-        json_value = click.get_text_stream("stdin").read()
-
+    if yaml_file:
+        json_value = yaml.safe_load(yaml_file)
     elif prompt:
-        json_value = click.prompt(f"Please enter value for `{name}`", hide_input=True)
-
-    elif len(value) == 1:
-        json_value = value[0]
-
-    else:
-        json_value = list(value)
-
-    if format_yaml:
-        if not isinstance(json_value, str):
-            raise click.UsageError(
-                "Cannot pass several values when using yaml format. "
-                "Please use a yaml list instead."
+        json_value = {}
+        for key in attributes:
+            json_value[key] = click.prompt(
+                f"Please enter a value for key `{key}` of `{path}`", hide_input=True
             )
-        json_value = yaml.safe_load(json_value)
-
-    if strip and isinstance(json_value, str):
-        json_value = fix_whitespaces(string=json_value)
+    else:
+        json_value = dict(build_kv(attributes))
 
     try:
-        client_obj.set_secret(path=name, value=json_value, force=force)
+        client_obj.set_secret(path=path, value=json_value, force=force, update=update)
     except exceptions.VaultOverwriteSecretError as exc:
         raise click.ClickException(
             f"Secret already exists at {exc.path}. Use -f to force overwriting."
@@ -321,27 +346,16 @@ def set_(
     click.echo("Done")
 
 
-def fix_whitespaces(string: str) -> str:
-    """
-    Single line secrets are stripped of all surrounding whitespace, which most probably
-    got here by accident. Multiline secrets are stripped, but a single trailing new line
-    is enforced.
-    """
-    stripped = string.strip()
-    if "\n" in stripped:
-        stripped += "\n"
-    return stripped
-
-
 @cli.command()
 @click.pass_obj
 @click.argument("name")
+@click.argument("key", required=False)
 @handle_errors()
-def delete(client_obj: client.VaultClientBase, name: str) -> None:
+def delete(client_obj: client.VaultClientBase, name: str, key: Optional[str]) -> None:
     """
     Delete a single secret.
     """
-    client_obj.delete_secret(path=name)
+    client_obj.delete_secret(path=name, key=key)
     click.echo("Done")
 
 
@@ -379,22 +393,27 @@ def env(
     the parent of the given path as variable name
     e.g.: for a/b/key, --path a/b gives `B_KEY=...`
     e.g.: for a/b/key, --path a/b/key gives `KEY=...`
+    TODO fix me
     """
     paths = list(path) or [""]
 
     env_secrets = {}
 
     for path in paths:
-        path, _, prefix = path.partition("=")
-        secrets = client_obj.get_secrets(path)
-        env_secrets.update(
-            {
-                environment.make_env_key(
-                    path=path, prefix=prefix, key=key
-                ): environment.make_env_value(value)
-                for key, value in secrets.items()
-            }
-        )
+        path_with_key, _, prefix = path.partition("=")
+        path, _, filter_key = path_with_key.partition(":")
+
+        if filter_key:
+            secret = client_obj.get_secret(path=path, key=filter_key)
+            env_updates = environment.get_envvars_for_secret(
+                key=filter_key, secret=secret, prefix=prefix
+            )
+        else:
+            secrets = client_obj.get_secrets(path=path, relative=True)
+            env_updates = environment.get_envvars_for_secrets(
+                path=path, prefix=prefix, secrets=secrets
+            )
+        env_secrets.update(env_updates)
 
     environ = os.environ.copy()
     environ.update(env_secrets)
