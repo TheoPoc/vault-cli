@@ -394,6 +394,10 @@ The name is always the uppercase underscored name of the equivalent command
 line option. Token and password can also be passed as environment variables as
 VAULT_CLI_TOKEN and VAULT_CLI_PASSWORD.
 
+## Integrate with SystemD
+
+See [dedicated document](README-systemd.md).
+
 ## Troubleshooting
 
 ### `SyntaxError: invalid syntax`
